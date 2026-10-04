@@ -1,3 +1,4 @@
+source("renv/activate.R")
 # Runs automatically when R starts in this folder (Rscript, RStudio or VS Code).
 if (file.exists("renv/activate.R")) source("renv/activate.R")
 
