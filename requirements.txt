@@ -1,0 +1,8 @@
+# Python environment used by subgroupsem through reticulate.
+# Use Python 3.11 or 3.12 (numpy 1.26 has no wheels for 3.13).
+pysubgroup==0.7.8      # subgroupsem checks for exactly this version
+pandas==2.2.3          # pandas 3.x breaks the R -> Python data transfer
+numpy==1.26.4
+scipy==1.17.1
+matplotlib==3.11.2     # figures (python/make_figures.py)
+setuptools==80.10.2    # must stay < 81: subgroupsem needs pkg_resources

@@ -1,0 +1,307 @@
+diff -ruN -x .git subgroupsem/DESCRIPTION bep/pkg/subgroupsem/DESCRIPTION
+--- upstream/DESCRIPTION	2026-10-04 10:24:37.490527485 +0000
++++ bep/DESCRIPTION	2026-10-04 10:30:14.720879886 +0000
+@@ -1,7 +1,7 @@
+ Package: subgroupsem
+ Type: Package
+ Title: Subgroup Discovery in Structural Equation Models
+-Version: 0.1-0.9017
++Version: 0.1-0.9017.9001
+ Date: 2022-04-04
+ Authors@R: c(person(given = "Benedikt", family = "Langenberg",
+                     role  = c("aut", "cre"),
+diff -ruN -x .git subgroupsem/NEWS.md bep/pkg/subgroupsem/NEWS.md
+--- upstream/NEWS.md	2026-10-04 10:24:37.490527485 +0000
++++ bep/NEWS.md	2026-10-04 10:30:14.721182054 +0000
+@@ -1,3 +1,14 @@
++# subgroupsem 0.1-0.9017.9001 (BEP fork, An-Mei Lucassen)
++
++* Added algorithms 'Apriori' and 'BestFirst' (from pysubgroup 0.7.8).
++* SEM_QF is now a BoundedInterestingnessMeasure with optimistic estimate +Inf,
++  so no candidate is ever pruned because of its quality.
++* Unknown algorithm names now stop with an error (previously only a warning
++  followed by an obscure error).
++* Added slots 'algorithm', 'counters' (descriptions evaluated, rejected by size,
++  model fits) and 'log' (optional per-candidate log, keep_log = TRUE).
++* The 'subgroup' column of summary_statistics is now a character string.
++
+ # subgroupsem 0.1.0-9000
+ 
+ * Adapted subgroupsem to pysubgroup version 0.7.2
+diff -ruN -x .git subgroupsem/R/00class.R bep/pkg/subgroupsem/R/00class.R
+--- upstream/R/00class.R	2026-10-04 10:24:37.490527485 +0000
++++ bep/R/00class.R	2026-10-04 10:30:14.720483833 +0000
+@@ -8,7 +8,10 @@
+     representation(
+         call = "call",
+         time_elapsed = "difftime",
+-        summary_statistics = "data.frame"
++        summary_statistics = "data.frame",
++        algorithm = "character",
++        counters = "list",
++        log = "data.frame"
+     )
+ )
+ 
+diff -ruN -x .git subgroupsem/R/subgroupsem.R bep/pkg/subgroupsem/R/subgroupsem.R
+--- upstream/R/subgroupsem.R	2026-10-04 10:24:37.491740819 +0000
++++ bep/R/subgroupsem.R	2026-10-04 10:30:14.719812127 +0000
+@@ -17,9 +17,10 @@
+ #' @param ignore Optional argument. If \code{columns = NULL}, \code{ignore} will
+ #' be used to select every column that is not in ignore.
+ #' @param algorithm A character specifying the subgroup discovery algorithm to
+-#' use. An exhaustive depth-first search is provided with 'SimpleDFS' (default)
+-#' . A heuristic (non-exhaustive) Beam search is provided with 'Beam', but not
+-#' yet implemented.
++#' use: 'SimpleDFS' or 'DFS' (default, exhaustive depth-first search),
++#' 'Apriori' (exhaustive level-wise search), 'BestFirst' (exhaustive best-first
++#' search; without optimistic estimates the queue order is by description) or
++#' 'Beam' (heuristic beam search with beam width \code{bw}).
+ #' @param max_n_subgroups Maximum number of subgroups. Default is 10.
+ #' @param search_depth Maximum number of attribute combinations. Default is 3.
+ #' @param min_quality Minimum value of interestingness measure. Values below
+@@ -34,6 +35,8 @@
+ #' @param generalization_aware This option is \emph{deprecated}.
+ #' @param bw Integer for beam width. Only used if algorithm is Beam search.
+ #' Defaults to \code{max_n_subgroups}.
++#' @param keep_log Logical. If TRUE, a per-candidate log is kept and returned
++#' in slot \code{log}. Defaults to FALSE (no logging overhead).
+ #' @param verbose Logical. Get some information, what is going on. Defaults
+ #' to \code{FALSE}.
+ #' @param ... Additional arguments to be passed to \code{f_fit}. Currently,
+@@ -115,6 +118,7 @@
+                         generalization_aware = FALSE,
+                         na_rm = FALSE,
+                         bw = NULL,
++                        keep_log = FALSE,
+                         verbose = FALSE,
+                         ...) {
+ 
+@@ -165,7 +169,13 @@
+     has_na <- sapply(columns, function(column) is.na(dat[, column]))
+ 
+     subsem_county <- 1L
+-    f_fit_internal <- function(sg, selectors = NULL) {
++    # BEP: counters and optional R-side log
++    cnt <- new.env()
++    cnt$n_below_min_size <- 0L
++    cnt$n_root <- 0L
++    cnt$n_fit <- 0L
++    cnt$rlog <- vector("list", 0L)
++    f_fit_internal <- function(sg, selectors = NULL, order = NA_integer_) {
+         # Empty selectors are transfered as empty list...
+         if (is.list(selectors)) selectors <- unlist(selectors)
+         ## if selectors for subgroup is not NULL
+@@ -178,9 +188,17 @@
+         # Check if subgroup is big enough, else return -1
+         if (!is.null(min_subgroup_size)) {
+             if (sum(sg, na.rm = TRUE) < min_subgroup_size) {
++                cnt$n_below_min_size <- cnt$n_below_min_size + 1L
+                 return(-1)
+             }
+         }
++        # the empty description covers everybody; the subsem_* wrappers
++        # return 0 for it without fitting a model
++        if (all(sg == 1, na.rm = TRUE)) {
++            cnt$n_root <- cnt$n_root + 1L
++        } else {
++            cnt$n_fit <- cnt$n_fit + 1L
++        }
+ 
+         if (verbose) {
+             if (subsem_county > 1L) {
+@@ -199,7 +217,16 @@
+         }
+ 
+         ## pass sg and dat to user specified function
+-        return(f_fit(sg, dat))
++        if (!keep_log) {
++            return(f_fit(sg, dat))
++        }
++        t0 <- proc.time()[["elapsed"]]
++        rval <- f_fit(sg, dat)
++        t1 <- proc.time()[["elapsed"]]
++        cnt$rlog[[length(cnt$rlog) + 1L]] <- list(
++            order = as.integer(order), t_r_fit_s = t1 - t0
++        )
++        return(rval)
+     }
+     py_main$f_fit <- f_fit_internal
+ 
+@@ -221,7 +248,7 @@
+         py_main$data,
+         py_main$target,
+         py_main$searchspace,
+-        qf = py_main$SEM_QF(),
++        qf = py_main$SEM_QF(keep_log = keep_log),
+         result_set_size = max_n_subgroups,
+         depth = search_depth,
+         min_quality = min_quality,
+@@ -232,29 +259,56 @@
+     # only DFS implemented at the moment
+     # Beam search should follow shortly
+     # Double beam search, perhaps?
++    known <- c("SimpleDFS", "DFS", "Beam", "Apriori", "BestFirst")
++    if (!(algorithm %in% known)) {
++        stop("subgroupsem error: unknown algorithm '", algorithm,
++             "'. Use one of: ", paste(known, collapse = ", "))
++    }
++    if (algorithm == "Beam") {
++        py_main$bw <- as.integer(if (is.null(bw)) max_n_subgroups else bw)
++    }
+     start <- Sys.time()
+     if (algorithm == "SimpleDFS" | algorithm == "DFS") {
+         py_run_string("result = ps.SimpleDFS().execute(task)")
+     } else if (algorithm == "Beam") {
+-        if (is.null(bw)) {
+-            py_main$bw <- as.integer(max_n_subgroups)
+-        } else {
+-            py_main$bw <- as.integer(bw)
+-        }
+         py_run_string("result = ps.BeamSearch(beam_width=bw).execute(task)")
+-    } else {
+-        warning(
+-            paste(
+-                "subgroupsem warning:",
+-                "Currently only depth-first-search (DFS) and beam search are available as algorithms."
+-            )
+-        )
++    } else if (algorithm == "Apriori") {
++        # use_numba=False: no JIT compilation inside the timed region.
++        # use_vectorization=False: the vectorised path needs numeric
++        # statistics tuples, which SEM_QF does not provide.
++        py_run_string(paste(
++            "apriori = ps.Apriori(use_numba=False)",
++            "apriori.use_vectorization = False",
++            "result = apriori.execute(task)",
++            sep = "\n"
++        ))
++    } else if (algorithm == "BestFirst") {
++        py_run_string("result = ps.BestFirstSearch().execute(task)")
+     }
+     end <- Sys.time()
+ 
+     # Import results
+     obj@time_elapsed <- end - start
+-    obj@summary_statistics <- py_main$result$to_dataframe()
++    obj@algorithm <- algorithm
++    res <- py_main$result$to_dataframe()
++    res$subgroup <- vapply(res$subgroup, function(x) as.character(x), "")
++    obj@summary_statistics <- res
++    obj@counters <- list(
++        n_selectors = length(py_main$searchspace),
++        n_evaluated = as.integer(py_main$task$qf$n_evaluated),
++        n_below_30 = as.integer(py_main$task$qf$n_below_30),
++        n_below_min_size = cnt$n_below_min_size,
++        n_root = cnt$n_root,
++        n_fit = cnt$n_fit
++    )
++    if (keep_log) {
++        plog <- do.call(rbind, lapply(py_main$task$qf$log, as.data.frame))
++        if (length(cnt$rlog) > 0) {
++            rlog <- do.call(rbind, lapply(cnt$rlog, as.data.frame))
++            plog <- merge(plog, rlog, by = "order", all.x = TRUE, sort = TRUE)
++        }
++        obj@log <- plog
++    }
+ 
+     # At last try to remove everything on the Python site from memory
+     clean_up_python()
+diff -ruN -x .git subgroupsem/inst/py_classes/sem_target.py bep/pkg/subgroupsem/inst/py_classes/sem_target.py
+--- upstream/inst/py_classes/sem_target.py	2026-10-04 10:24:37.495220018 +0000
++++ bep/inst/py_classes/sem_target.py	2026-10-04 10:30:14.720207047 +0000
+@@ -1,6 +1,7 @@
+ from pysubgroup.measures import AbstractInterestingnessMeasure, \
+     BoundedInterestingnessMeasure
+ 
++import time
+ import numpy as np
+ 
+ 
+@@ -20,7 +21,7 @@
+         return str(self) < str(other)
+ 
+     def get_attributes(self):
+-        return [] 
++        return []
+ 
+     def calculate_statistics(self, subgroup, data, stats):
+         sg_instances = subgroup.covers(data)
+@@ -30,30 +31,59 @@
+         return statistics
+ 
+ 
+-class SEM_QF(AbstractInterestingnessMeasure):
+-    def __init__(self):
+-    	pass
++# BEP change 1: SEM_QF now derives from BoundedInterestingnessMeasure.
++# pysubgroup's Apriori refuses quality functions that are not "bounded".
++# The optimistic estimate below is +inf for every candidate, so no branch
++# can ever be pruned because of its quality: DFS, Apriori and best-first
++# search stay exhaustive (up to depth and minimum size), as in the proposal.
++class SEM_QF(BoundedInterestingnessMeasure):
++    def __init__(self, keep_log=False):
++        # BEP change 2: counters (always on, negligible cost) and an optional
++        # per-candidate log (off by default, so the timed code path equals
++        # the original one unless logging is requested).
++        self.keep_log = keep_log
++        self.n_evaluated = 0          # every description the algorithm scores
++        self.n_below_30 = 0           # rejected by the hard minimum of 30 rows
++        self.log = []
++        self._last_exit = None
+ 
+-    # musste ich einfuegen. ist das neu?
+     def calculate_constant_statistics(self, data, target):
+         pass
+ 
+-    def calculate_statistics(self, subgroup, target, data):
++    def calculate_statistics(self, subgroup, target, data, statistics=None):
+         pass
+ 
+-    # Changed from "evaluate_from_data" to "calculate_statistics"
++    def optimistic_estimate(self, subgroup, target, data, statistics):
++        return float("inf")
++
+     def evaluate(self, subgroup, target, data, statistics):
+-        #if len(subgroup.covers) == 0:
+-        #    return -1
++        t_enter = time.perf_counter()
++        self.n_evaluated += 1
+         instances = subgroup.covers(data)
+ 
+         variables = [str(selector.attribute_name) for selector in subgroup.selectors]
+-        
+-        if (instances.sum() < 30):
+-            return -1
+-
+-        rval = f_fit(instances, variables)
+ 
++        if (instances.sum() < 30):
++            self.n_below_30 += 1
++            rval = -1
++        else:
++            rval = f_fit(instances, variables, self.n_evaluated)
++
++        if self.keep_log:
++            t_exit = time.perf_counter()
++            self.log.append({
++                "order": self.n_evaluated,
++                "description": str(subgroup),
++                "depth": len(subgroup.selectors),
++                "cover_size": int(instances.sum()),
++                "quality": float(rval),
++                # time spent in Python between two evaluations
++                # (candidate generation + bookkeeping of the algorithm)
++                "t_between_s": (t_enter - self._last_exit) if self._last_exit else float("nan"),
++                # time of this evaluation as seen from Python (includes Python->R call)
++                "t_eval_s": t_exit - t_enter,
++            })
++            self._last_exit = time.perf_counter()
+         return rval
+ 
+     def is_applicable(self, subgroup):
+@@ -61,4 +91,3 @@
+ 
+     def supports_weights(self):
+         return False
+-

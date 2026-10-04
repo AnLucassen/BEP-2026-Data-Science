@@ -17,9 +17,10 @@
 #' @param ignore Optional argument. If \code{columns = NULL}, \code{ignore} will
 #' be used to select every column that is not in ignore.
 #' @param algorithm A character specifying the subgroup discovery algorithm to
-#' use. An exhaustive depth-first search is provided with 'SimpleDFS' (default)
-#' . A heuristic (non-exhaustive) Beam search is provided with 'Beam', but not
-#' yet implemented.
+#' use: 'SimpleDFS' or 'DFS' (default, exhaustive depth-first search),
+#' 'Apriori' (exhaustive level-wise search), 'BestFirst' (exhaustive best-first
+#' search; without optimistic estimates the queue order is by description) or
+#' 'Beam' (heuristic beam search with beam width \code{bw}).
 #' @param max_n_subgroups Maximum number of subgroups. Default is 10.
 #' @param search_depth Maximum number of attribute combinations. Default is 3.
 #' @param min_quality Minimum value of interestingness measure. Values below
@@ -34,6 +35,8 @@
 #' @param generalization_aware This option is \emph{deprecated}.
 #' @param bw Integer for beam width. Only used if algorithm is Beam search.
 #' Defaults to \code{max_n_subgroups}.
+#' @param keep_log Logical. If TRUE, a per-candidate log is kept and returned
+#' in slot \code{log}. Defaults to FALSE (no logging overhead).
 #' @param verbose Logical. Get some information, what is going on. Defaults
 #' to \code{FALSE}.
 #' @param ... Additional arguments to be passed to \code{f_fit}. Currently,
@@ -115,6 +118,7 @@ subgroupsem <- function(f_fit,
                         generalization_aware = FALSE,
                         na_rm = FALSE,
                         bw = NULL,
+                        keep_log = FALSE,
                         verbose = FALSE,
                         ...) {
 
@@ -165,7 +169,13 @@ subgroupsem <- function(f_fit,
     has_na <- sapply(columns, function(column) is.na(dat[, column]))
 
     subsem_county <- 1L
-    f_fit_internal <- function(sg, selectors = NULL) {
+    # BEP: counters and optional R-side log
+    cnt <- new.env()
+    cnt$n_below_min_size <- 0L
+    cnt$n_root <- 0L
+    cnt$n_fit <- 0L
+    cnt$rlog <- vector("list", 0L)
+    f_fit_internal <- function(sg, selectors = NULL, order = NA_integer_) {
         # Empty selectors are transfered as empty list...
         if (is.list(selectors)) selectors <- unlist(selectors)
         ## if selectors for subgroup is not NULL
@@ -178,8 +188,16 @@ subgroupsem <- function(f_fit,
         # Check if subgroup is big enough, else return -1
         if (!is.null(min_subgroup_size)) {
             if (sum(sg, na.rm = TRUE) < min_subgroup_size) {
+                cnt$n_below_min_size <- cnt$n_below_min_size + 1L
                 return(-1)
             }
+        }
+        # the empty description covers everybody; the subsem_* wrappers
+        # return 0 for it without fitting a model
+        if (all(sg == 1, na.rm = TRUE)) {
+            cnt$n_root <- cnt$n_root + 1L
+        } else {
+            cnt$n_fit <- cnt$n_fit + 1L
         }
 
         if (verbose) {
@@ -199,7 +217,16 @@ subgroupsem <- function(f_fit,
         }
 
         ## pass sg and dat to user specified function
-        return(f_fit(sg, dat))
+        if (!keep_log) {
+            return(f_fit(sg, dat))
+        }
+        t0 <- proc.time()[["elapsed"]]
+        rval <- f_fit(sg, dat)
+        t1 <- proc.time()[["elapsed"]]
+        cnt$rlog[[length(cnt$rlog) + 1L]] <- list(
+            order = as.integer(order), t_r_fit_s = t1 - t0
+        )
+        return(rval)
     }
     py_main$f_fit <- f_fit_internal
 
@@ -221,7 +248,7 @@ subgroupsem <- function(f_fit,
         py_main$data,
         py_main$target,
         py_main$searchspace,
-        qf = py_main$SEM_QF(),
+        qf = py_main$SEM_QF(keep_log = keep_log),
         result_set_size = max_n_subgroups,
         depth = search_depth,
         min_quality = min_quality,
@@ -232,29 +259,56 @@ subgroupsem <- function(f_fit,
     # only DFS implemented at the moment
     # Beam search should follow shortly
     # Double beam search, perhaps?
+    known <- c("SimpleDFS", "DFS", "Beam", "Apriori", "BestFirst")
+    if (!(algorithm %in% known)) {
+        stop("subgroupsem error: unknown algorithm '", algorithm,
+             "'. Use one of: ", paste(known, collapse = ", "))
+    }
+    if (algorithm == "Beam") {
+        py_main$bw <- as.integer(if (is.null(bw)) max_n_subgroups else bw)
+    }
     start <- Sys.time()
     if (algorithm == "SimpleDFS" | algorithm == "DFS") {
         py_run_string("result = ps.SimpleDFS().execute(task)")
     } else if (algorithm == "Beam") {
-        if (is.null(bw)) {
-            py_main$bw <- as.integer(max_n_subgroups)
-        } else {
-            py_main$bw <- as.integer(bw)
-        }
         py_run_string("result = ps.BeamSearch(beam_width=bw).execute(task)")
-    } else {
-        warning(
-            paste(
-                "subgroupsem warning:",
-                "Currently only depth-first-search (DFS) and beam search are available as algorithms."
-            )
-        )
+    } else if (algorithm == "Apriori") {
+        # use_numba=False: no JIT compilation inside the timed region.
+        # use_vectorization=False: the vectorised path needs numeric
+        # statistics tuples, which SEM_QF does not provide.
+        py_run_string(paste(
+            "apriori = ps.Apriori(use_numba=False)",
+            "apriori.use_vectorization = False",
+            "result = apriori.execute(task)",
+            sep = "\n"
+        ))
+    } else if (algorithm == "BestFirst") {
+        py_run_string("result = ps.BestFirstSearch().execute(task)")
     }
     end <- Sys.time()
 
     # Import results
     obj@time_elapsed <- end - start
-    obj@summary_statistics <- py_main$result$to_dataframe()
+    obj@algorithm <- algorithm
+    res <- py_main$result$to_dataframe()
+    res$subgroup <- vapply(res$subgroup, function(x) as.character(x), "")
+    obj@summary_statistics <- res
+    obj@counters <- list(
+        n_selectors = length(py_main$searchspace),
+        n_evaluated = as.integer(py_main$task$qf$n_evaluated),
+        n_below_30 = as.integer(py_main$task$qf$n_below_30),
+        n_below_min_size = cnt$n_below_min_size,
+        n_root = cnt$n_root,
+        n_fit = cnt$n_fit
+    )
+    if (keep_log) {
+        plog <- do.call(rbind, lapply(py_main$task$qf$log, as.data.frame))
+        if (length(cnt$rlog) > 0) {
+            rlog <- do.call(rbind, lapply(cnt$rlog, as.data.frame))
+            plog <- merge(plog, rlog, by = "order", all.x = TRUE, sort = TRUE)
+        }
+        obj@log <- plog
+    }
 
     # At last try to remove everything on the Python site from memory
     clean_up_python()

@@ -1,0 +1,3 @@
+# Copy this file to ".Renviron" (no ".example") and put in the path of YOUR Python.
+# Use forward slashes. Find the path with:  python -c "import sys; print(sys.executable)"
+RETICULATE_PYTHON=C:/Users/YOURNAME/anaconda3/envs/bep/python.exe
