@@ -1,0 +1,33 @@
+Package: subgroupsem
+Type: Package
+Title: Subgroup Discovery in Structural Equation Models
+Version: 0.1-0.9017
+Date: 2022-04-04
+Authors@R: c(person(given = "Benedikt", family = "Langenberg",
+                    role  = c("aut", "cre"),
+                    email = "benedikt.langenberg@gmail.com"),
+             person(given = "Florian", family = "Lemmerich",
+                    role  = c("ctb"),
+                    email = "florian@lemmerich.net"),
+             person(given = "Christoph", family = "Kiefer",
+                    role  = c("aut"),
+                    email = "christoph.kiefer@uni-bielefeld.de",
+                    comment = c(ORCID = "0000-0002-9166-400X"))
+            )
+Maintainer: Benedikt Langenberg <benedikt.langenberg@gmail.com>
+Description: subgroupsem is an R package for discovering interesting subgroups 
+    with distinct sets of parameters in structural equation models (SEM).
+    It uses the reticulate package to import subgroup algorithms from Python
+    (pysubgroup module) and the lavaan package from R.
+Depends:
+    R (>= 4.1.0)
+Imports:
+    reticulate (>= 1.22),
+    lavaan
+License: GPL (>= 2)
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.1.2.9000
+Suggests: 
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
